@@ -1,107 +1,95 @@
 import torch
-import torch.utils.data
 import torch.optim as optim
 
 import configs as cfg
-from utils import file_tools, smi_tools, tools
+from utils import builder, smi_tools, tools
 from models import clm_rnn
 
 
-def smi_packer(list_of_smi, list_of_tokens):
-    list_of_tokenized_smi = [smi_tools.smi2tokens(smi, list_of_tokens) for smi in list_of_smi]
-    list_of_length = [len(smi) for smi in list_of_tokenized_smi]
-    max_length = max(list_of_length)
+def train_clm(data_path: str, smi_idx: int, model_name='clm', epochs=100, fq_saving=5,
+              model_path=None, pre_data_path=None, pre_smi_idx=None):
 
-    mat_of_ohe, mat_of_lb = smi_tools.smi_list2oh_mat(list_of_smi, list_of_tokens, max_length)
-    mat_of_ohe_pre = mat_of_ohe[:, 0:max_length - 1, :]
-    mat_of_tar_lb = mat_of_lb[:, 1::]
+    # processing smiles
+    data, _ = tools.load_data_from_csv(data_path, with_head=True)  # 从文件读入数据
+    smiles = [cfg.BOS + x[smi_idx] + cfg.EOS for x in data]  # 获取smiles
+    tokens = smi_tools.gather_tokens(smiles, single_split=cfg.SINGLE_TOKENIZE)  # 获取字符集合列表
+    print(f'Tokens: {tokens}')
 
-    mat_of_len_mask = [[1 if i < (x - 1) else 0 for i in range(max_length - 1)] for x in
-                       list_of_length]
-    mat_of_len_mask = torch.tensor(mat_of_len_mask)
+    #
+    if pre_data_path:
+        data, _ = tools.load_data_from_csv(pre_data_path, with_head=True)  # 从文件读入数据
+        pre_smiles = [cfg.BOS + x[pre_smi_idx] + cfg.EOS for x in data]  # 获取smiles
+        tokens = smi_tools.gather_tokens(pre_smiles, single_split=cfg.SINGLE_TOKENIZE)  # 获取字符集合列表
+        print(f'Tokens of pre-trained data: {tokens}')
+        print(f'There are {len(smiles)} SMILES strings in data.')
+        smiles = [smi for smi in smiles if smi_tools.if_oov_exclude(smi, tokens, single_split=cfg.SINGLE_TOKENIZE)]
+        print(f'There are {len(smiles)} SMILES strings after checking tokens.')
 
-    print('Shape of input(one-hot): ', mat_of_ohe_pre.size())
-    print('Shape of target(label): ', mat_of_tar_lb.size())
+    loader = builder.clm_packer(smiles, tokens)  # 封装数据
 
-    merge_data = torch.utils.data.TensorDataset(mat_of_ohe_pre, mat_of_tar_lb, mat_of_len_mask)
-    loader = torch.utils.data.DataLoader(merge_data, batch_size=cfg.CLM_BATCH_SIZE, shuffle=True)
+    # initialize clm
+    m = builder.build_clm(len(tokens), model_path)
+    # initial optimizer
+    opt = optim.Adam(m.parameters(), lr=cfg.CLM_LR_RATE)
 
-    return loader
-
-
-def train_clm(path_of_data: str, smi_idx: int, path_of_m: str, name_of_m: str, epochs=100, lr=cfg.CLM_LR_RATE, fq_saving=5):
-
-    data, head = file_tools.load_data_from_csv(path_of_data, with_head=True)
-    list_of_smi = [x[smi_idx] for x in data]
-    list_of_smi = [cfg.BOS + smi + cfg.EOS for smi in list_of_smi]
-    list_of_tokens = smi_tools.get_list_of_tokens(list_of_smi, single_split=cfg.SINGLE_TOKENIZE)
-    print(f'Tokens: {list_of_tokens}')
-    loader = smi_packer(list_of_smi, list_of_tokens)
-
-    m = clm_rnn.NNLM(size_of_oh=len(list_of_tokens),
-                     layers_of_rnn=cfg.CLM_N_RNN_LAYERS, units_of_rnn=cfg.CLM_N_RNN_UNITS,
-                     dropout_rate=cfg.CLM_DROPOUT_RATE)
-    m.to(cfg.DEVICE)
-    print(f'Structure of model:\n{m}')
-    count_of_weights = sum(p.numel() for p in m.parameters())
-    print(f'Number of parameters: {count_of_weights}')
-
-    params_of_m = m.parameters()
-    if path_of_m:
-        print(f'Load pre-trained model: {path_of_m}')
-        checkpoint = torch.load(path_of_m)
-        m.load_state_dict(checkpoint['model'])
-        for name, value in m.lstm.named_parameters():
-            # name_of_p = ['weight_ih_l0', 'weight_hh_l0', 'bias_ih_l0', 'bias_hh_l0']
-            name_of_p = []
-            if name in name_of_p:
-                print(f'[WARNING] Weights fixed: {name}')
-                value.requires_grad = False
-
-        params_of_m = filter(lambda p: p.requires_grad, m.parameters())
-    else:
-        print('No pre-trained model loaded')
-
-    opt = optim.Adam(params_of_m, lr=lr)
+    # training
     records = clm_rnn.train(model=m, optimizer=opt, data_loader=loader,
-                            epochs=epochs, fq_of_save=fq_saving, name=name_of_m)
+                            epochs=epochs, fq_of_save=fq_saving, name=model_name)
 
     return 0
 
 
-def generate(n: int, idx: int, p_data: str, p_model: str, p_saving: str, limit: int) -> list:
-    data, head = file_tools.load_data_from_csv(p_data, with_head=True)
-    lst_smi = [x[idx] for x in data]
-    lst_smi_ori = [smi_tools.to_canonical_smi(smi) for smi in lst_smi]
-    lst_smi_ori = [smi for smi in lst_smi_ori if smi is not None]
+def generate(n: int, idx: int, data_path: str, model_path: str, saving_path: str) -> list:
+    # processing smiles
+    data, head = tools.load_data_from_csv(data_path, with_head=True)  # 从文件读入数据
+    smiles = [x[idx] for x in data]  # 获取smiles
+    raw_smiles = [smi_tools.to_canonical_smi(smi) for smi in smiles]
+    raw_smiles = [smi for smi in raw_smiles if smi is not None]
 
-    lst_tokens = smi_tools.get_list_of_tokens([cfg.BOS + smi + cfg.EOS for smi in lst_smi],
-                                              single_split=cfg.SINGLE_TOKENIZE)
-    m = clm_rnn.NNLM(size_of_oh=len(lst_tokens),
-                     layers_of_rnn=cfg.CLM_N_RNN_LAYERS, units_of_rnn=cfg.CLM_N_RNN_UNITS,
-                     dropout_rate=cfg.CLM_DROPOUT_RATE)
-    m.to(cfg.DEVICE)
+    # initialize clm
+    tokens = smi_tools.gather_tokens([cfg.BOS + smi + cfg.EOS for smi in smiles], single_split=cfg.SINGLE_TOKENIZE)  # 获取字符集合列表
+    m = builder.build_clm(len(tokens), model_path)
 
-    checkpoint = torch.load(p_model)
-    m.load_state_dict(checkpoint['model'])
-    print('Model loaded !')
-
+    # sampling
     print('Sampling ...')
-    lst_smi_gen = clm_rnn.sample(model=m, token_list=lst_tokens, number_of_sample=n)
-    lst_smi_valid = [smi_tools.to_canonical_smi(smi) for smi in lst_smi_gen]
-    lst_smi_valid = [smi for smi in lst_smi_valid if smi is not None]
-    lst_smi_unique = list(set(lst_smi_valid))
-    lst_smi_novel = [smi for smi in lst_smi_unique if smi not in lst_smi_ori]
-
+    novel_smiles, record = builder.generate(n, m, raw_smiles, tokens)
     print('Sampling Finished !')
-    print(f'Sample:{n}, Valid:{len(lst_smi_valid)}, Unique:{len(lst_smi_unique)}, Novel:{len(lst_smi_novel)}, Limit: {limit}')
-    lst_smi_novel = lst_smi_novel[0:limit]
-    file_tools.save_data_to_csv(p_saving, [[smi] for smi in lst_smi_novel], ['smiles'])
+    print(f'Sample:{n}, Valid:{len(record[1])}, Unique:{len(record[2])}, Novel:{len(record[3])}')
+    tools.save_data_to_csv(saving_path, [[smi] for smi in novel_smiles], ['smiles'])
 
-    return lst_smi_novel
+    return novel_smiles
+
+
+def valid_generate(valid: int, idx: int, data_path: str, model_path: str, saving_path: str, tokens: list) -> list:
+    # processing smiles
+    data, head = tools.load_data_from_csv(data_path, with_head=True)  # 从文件读入数据
+    smiles = [x[idx] for x in data]  # 获取smiles
+    raw_smiles = [smi_tools.to_canonical_smi(smi) for smi in smiles]
+    raw_smiles = [smi for smi in raw_smiles if smi is not None]
+
+    # initialize clm
+    if not tokens:
+        tokens = smi_tools.gather_tokens([cfg.BOS + smi + cfg.EOS for smi in smiles], single_split=cfg.SINGLE_TOKENIZE)  # 获取字符集合列表
+    m = builder.build_clm(len(tokens), model_path)
+
+    # sampling
+    valid_smiles = []
+    while valid > 0:
+        generate_smiles = builder.sampling(m, tokens, n=1)
+        generate_smiles = smi_tools.to_canonical_smi(generate_smiles[0])
+        if generate_smiles:
+            valid -= 1
+            valid_smiles.append(generate_smiles)
+
+    unique_smiles = list(set(valid_smiles))
+    novel_smiles = [smi for smi in unique_smiles if smi not in raw_smiles]
+    tools.save_data_to_csv(saving_path, [[smi] for smi in valid_smiles], ['smiles'])
+    print(f'Valid: {len(valid_smiles)}, Unique: {len(unique_smiles)}, Novel: {len(novel_smiles)}')
+
+    return valid_smiles
 
 
 if __name__ == '__main__':
-    train_clm(path_of_data='data/Df.csv', smi_idx=0, path_of_m='', name_of_m='pt', epochs=20, fq_saving=1)
-    # train_clm(path_of_data='data/Dm.csv', smi_idx=0, path_of_m='record/pt-0005-24.5050.pth',
-    #           name_of_m='tl', epochs=40, fq_saving=5)
+    # 预训练
+    train_clm(data_path='data/Ds_5.csv', smi_idx=0, model_name='pt', epochs=30, fq_saving=5)
+    

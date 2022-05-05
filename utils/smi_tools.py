@@ -3,23 +3,29 @@ import torch
 import copy
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import AllChem
-from rdkit.Chem import Draw
-from collections import defaultdict
-
-import configs
+import configs as cfg
 
 
-def split_smi(smi: str) -> list:
+def to_canonical_smi(smi: str):
+    if cfg.BOS in smi:  # 去掉起始符
+        smi = smi.replace(cfg.BOS, '')
+    try:
+        mol = Chem.MolFromSmiles(smi)
+        Chem.SanitizeMol(mol)
+        canonical_smi = Chem.MolToSmiles(mol, canonical=True)
+        return canonical_smi
+    except:
+        # print('[WARNING] Invalid SMILES found: {}'.format(smi))
+        return None
+
+
+def tokenize(smiles: str) -> list:
     """
-    输入一个字符串，返回分词后的token列表
+    tokenize a SMILES and return a list containing all the tokens after tokenization.
     eg：
         O=[N+]([O-])
         -->
         ['O', '=', '[N+]', '(', '[O-]', ')']
-
-    :param smi: smiles字符串；str
-    :return: list(str)
     """
 
     REGEXPS = {
@@ -42,127 +48,82 @@ def split_smi(smi: str) -> list:
                 tokens.append(split)
         return tokens
 
-    tokens = split_by(smi, REGEXP_ORDER)
+    tokens = split_by(smiles, REGEXP_ORDER)
 
     return tokens
 
 
-def get_list_of_tokens(list_of_smi: list, single_split=False) -> list:
-    """
-    统计smiles列表中的token集合，返回token集合列表
-    :param list_of_smi: smiles字符串列表；list(str)
-    :param single_split: 是否按单个字符切分smiles字符串；bool
-    :return: list(str)
-    """
+def gather_tokens(smiles: list, single_split=False) -> list:
 
-    if single_split:
-        list_of_tokenized_smi = [[c for c in x] for x in list_of_smi]
-        set_of_token = set()
-        for tokenized_smi in list_of_tokenized_smi:
-            set_of_token.update(tokenized_smi)
-
-        set_of_token = sorted(set_of_token)
-
-        return list(set_of_token)
-
-    else:
-        list_of_tokenized_smi = [split_smi(x) for x in list_of_smi]
-        set_of_token = set()
-        for tokenized_smi in list_of_tokenized_smi:
-            set_of_token.update(tokenized_smi)
-
-        set_of_token = sorted(set_of_token)
-
-        return list(set_of_token)
+    tokenized_smiles = [[c for c in smi] for smi in smiles] if single_split else [tokenize(smi) for smi in smiles]
+    token_set = set()
+    for tokenized_smi in tokenized_smiles:
+        token_set.update(tokenized_smi)
+    token_set = sorted(token_set)
+    return list(token_set)
 
 
-def smi2tokens(smi: str, list_of_tokens: list) -> list:
-    """
-    根据token集合列表划分一个smiles字符串为片段列表
-    :param smi: smiles字符串；str
-    :param list_of_tokens:
-    :return: list(str)
-    """
+def if_oov_exclude(smiles: str, tokens: list, single_split=False) -> bool:
+
+    tks = [c for c in smiles] if single_split else tokenize(smiles)
+    differ = [token for token in tks if token not in tokens]
+    return False if differ else True
+
+
+def if_each_fold_cover_all_tokens(folds: list, tokens: list) -> bool:
+
+    for i, fold in enumerate(folds):
+        train_smi = fold[0]
+        fold_tokens = gather_tokens([cfg.BOS + smi + cfg.EOS for smi in train_smi], single_split=cfg.SINGLE_TOKENIZE)
+        print(f'Fold {i}, Tokens: {fold_tokens}')
+        if fold_tokens != tokens:
+            return False
+    return True
+
+
+def tokenize_smiles(smiles: str, tokens: list) -> list:
 
     frags = []
-    while smi:
-        old_s = smi
-        for token in list_of_tokens:
+    while smiles:
+        snapshot = smiles
+        for token in tokens:
             length = len(token)
-            if smi[0:length] == token:
-                if smi[0:length+1] == 'Cl':
-                    smi = smi.replace('Cl', '', 1)
-                    frags.append('Cl')
-                elif smi[0:length+1] == 'Br':
-                    smi = smi.replace('Br', '', 1)
-                    frags.append('Br')
-                elif smi[0:length+1] == 'Si':
-                    smi = smi.replace('Si', '', 1)
-                    frags.append('Si')
-                else:
-                    smi = smi.replace(token, '', 1)
-                    frags.append(token)
+            if smiles[0:length] == token:
+                # 第二位检测，避免cl被c替换
+                sub = smiles[0:length+1]
+                sub = sub if sub in ['Cl', 'Br', 'Si'] else token
+                smiles = smiles.replace(sub, '', 1)
+                frags.append(sub)
 
-        if old_s == smi:
-            raise RuntimeError('A substring \'{}\' includes token which not in the token list {}!'
-                               .format(smi, list_of_tokens))
+        if snapshot == smiles:
+            raise RuntimeError(f'A substring \'{smiles}\' includes token which not in the token list {tokens}!')
 
     return frags
 
 
-def smi2oh(smi: str, list_of_tokens: list) -> torch.tensor:
+def smiles2tensor(smiles: str, tokens: list, encoding=True) -> torch.tensor:
     """
-    将一个smiles字符串转为one-hot编码后的tensor
-
-    :param smi: smiles字符串；str
-    :param list_of_tokens: list(str)
-    :return: torch.tensor
-    """
-
-    smi_tokenized = smi2tokens(smi, list_of_tokens)
-    smi_labeled = torch.tensor([list_of_tokens.index(x) for x in smi_tokenized])
-
-    smi_oh = torch.zeros(len(smi_labeled), len(list_of_tokens))
-    smi_oh[range(len(smi_oh)), smi_labeled] = 1
-
-    return smi_oh
-
-
-def smi_list2oh_mat(smi_list: list, list_of_tokens: list, max_len: int) -> torch.tensor:
-    """
-    将smiles字符串列表转为one-hot编码后的tensor
-
-    :param smi_list: smiles字符串列表；list(str)
-    :param list_of_tokens: list(str)
-    :param max_len: smiles字符串的最大长度；int
-    :return: torch.tensor
+    convert a SMILES into an One-Hot tensor if encoding is True, else a label tensor.
+    :param smiles:
+    :param tokens:
+    :param encoding:
+    :return:
     """
 
-    list_of_tokenized_smi = [smi2tokens(smi, list_of_tokens) for smi in smi_list]
-    mat_of_labeled_smi = torch.zeros(len(smi_list), max_len)  # [n, max_len]
+    tokenized_smiles = tokenize_smiles(smiles, tokens)
+    labeled_smiles = torch.tensor([tokens.index(x) for x in tokenized_smiles])
 
-    for i in range(len(list_of_tokenized_smi)):
-        for j in range(len(list_of_tokenized_smi[i])):
-            mat_of_labeled_smi[i, j] = list_of_tokens.index(list_of_tokenized_smi[i][j])
-
-    mat_of_ohe = torch.zeros(len(smi_list), max_len, len(list_of_tokens))
-
-    for i in range(len(list_of_tokenized_smi)):
-        for j in range(len(list_of_tokenized_smi[i])):
-            idx = int(mat_of_labeled_smi[i, j].item())
-            mat_of_ohe[i, j, idx] = 1
-
-    return mat_of_ohe, mat_of_labeled_smi
+    if encoding:
+        oh_tensor = torch.zeros(len(labeled_smiles), len(tokens))
+        oh_tensor[range(len(oh_tensor)), labeled_smiles] = 1
+        return oh_tensor
+    else:
+        return labeled_smiles
 
 
-def smi2fp(smi_list: list, bits=2048) -> np.array:
-    """
-    将smiles字符串列表转为分子指纹矩阵
+def smiles2ecfp(smi_list: list, bits=2048) -> np.array:
 
-    :param smi_list: smiles字符串列表；list(str)
-    :param bits: ECFP指纹编码位数；int
-    :return: numpy.array
-    """
+    from rdkit.Chem import AllChem
 
     all_fp = np.zeros((len(smi_list), bits))
     for idx, smi in enumerate(smi_list):
@@ -172,15 +133,82 @@ def smi2fp(smi_list: list, bits=2048) -> np.array:
     return all_fp
 
 
-def to_canonical_smi(smi: str):
-    if configs.BOS in smi:  # 去掉起始符
-        smi = smi.replace(configs.BOS, '')
-    try:
-        mol = Chem.MolFromSmiles(smi)
-        Chem.SanitizeMol(mol)
-        canonical_smi = Chem.MolToSmiles(mol, canonical=True)
-        return canonical_smi
-    except:
-        # print('wrong smiles: {}'.format(smi))
-        return None
+def get_sa(smiles: list) -> list:
+    from rdkit.Chem import AllChem as Chem
+    from utils.SA_Score import sascorer
 
+    lst_mol = [Chem.MolFromSmiles(smi) for smi in smiles]
+    sa = [sascorer.calculateScore(mole) if mole else float('inf') for mole in lst_mol]
+    return sa
+
+
+def sum_over_bonds(mol_list, predefined_bond_types=[], return_names=True):
+    """
+    copy from https://github.com/delton137/mmltoolkit
+    """
+    from collections import defaultdict
+
+    if (isinstance(mol_list, list) == False):
+        mol_list = [mol_list]
+
+    empty_bond_dict = defaultdict(lambda: 0)
+    num_mols = len(mol_list)
+
+    if (len(predefined_bond_types) == 0):
+        # first pass through to enumerate all bond types in all molecules and set them equal to zero in the dict
+        for i, mol in enumerate(mol_list):
+            bonds = mol.GetBonds()
+            for bond in bonds:
+                bond_start_atom = bond.GetBeginAtom().GetSymbol()
+                bond_end_atom = bond.GetEndAtom().GetSymbol()
+                bond_type = bond.GetSmarts(allBondsExplicit=True)
+                bond_atoms = [bond_start_atom, bond_end_atom]
+                if (bond_type == ''):
+                    bond_type = "-"
+                bond_string = min(bond_atoms) + bond_type + max(bond_atoms)
+                empty_bond_dict[bond_string] = 0
+    else:
+        for bond_string in predefined_bond_types:
+            empty_bond_dict[bond_string] = 0
+
+    # second pass through to construct X
+    bond_types = list(empty_bond_dict.keys())
+    num_bond_types = len(bond_types)
+
+    X_LBoB = np.zeros([num_mols, num_bond_types])
+
+    for i, mol in enumerate(mol_list):
+        bonds = mol.GetBonds()
+        bond_dict = copy.deepcopy(empty_bond_dict)
+        for bond in bonds:
+            bond_start_atom = bond.GetBeginAtom().GetSymbol()
+            bond_end_atom = bond.GetEndAtom().GetSymbol()
+            # skip dummy atoms
+            if (bond_start_atom == '*' or bond_end_atom == '*'):
+                pass
+            else:
+                bond_type = bond.GetSmarts(allBondsExplicit=True)
+                if (bond_type == ''):
+                    bond_type = "-"
+                bond_atoms = [bond_start_atom, bond_end_atom]
+                bond_string = min(bond_atoms) + bond_type + max(bond_atoms)
+                bond_dict[bond_string] += 1
+
+        # at the end, pick out only the relevant ones
+        X_LBoB[i, :] = [bond_dict[bond_type] for bond_type in bond_types]
+
+    if (return_names):
+        return bond_types, X_LBoB
+    else:
+        return X_LBoB
+
+
+if __name__ == '__main__':
+    s = ['NN([N]c1nonc1[N][N]c1nonc1[N]N([O])c1nonc1N[N+](=O)[O-])c1nonc1N[N+](=O)[O-]',
+         '[N]N([N]c1nonc1[N][N]c1nonc1[N]N(N)[N+](=O)[O-])c1nonc1N[N+](=O)[O-]',
+         'O=C1c2[c][c]c([N+](=O)[O-])[c]c2[C]2[C][C]=[C][N]N21']
+
+    tokens = gather_tokens(s)
+    print(tokens)
+    oh = smiles2tensor('O=C1c2[c][c]c([N+](=O)[O-])[c]c2[C]2[C][C]=[C][N]N21', tokens)
+    print(oh)
